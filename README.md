@@ -1,3 +1,3 @@
 # Streamlit-Based WebApp for Spectrophotometric Measurements
 
-## Streamlit Link: Shttps://spectrophotometry-gui.streamlit.app/
+## Streamlit Link: [Spectrophotometry Absorbance Calculator](Shttps://spectrophotometry-gui.streamlit.app/)
