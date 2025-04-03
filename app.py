@@ -3,630 +3,950 @@ import numpy as np
 import pandas as pd
 import io
 import plotly.graph_objects as go
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
 from functools import lru_cache
 
-# Set page configuration
-st.set_page_config(page_title="Spectrophotometry Absorbance Calculator", layout="wide")
-st.title("Spectrophotometry Absorbance Calculator")
-st.write("Upload reference (blank) and sample files to calculate absorbance according to Beer-Lambert Law.")
+# --- Constants ---
+# Default values, can be overridden by data range or user input
+DEFAULT_SPECTRUM_MIN = 340
+DEFAULT_SPECTRUM_MAX = 800
+EPSILON = 1e-10     # Small value to prevent division by zero or log of zero
 
-# Define constants
-SPECTRUM_MIN = 340  # nm
-SPECTRUM_MAX = 800  # nm
-EPSILON = 1e-10  # Small value to prevent division by zero or log of zero
+# --- Caching Functions ---
 
-# Function to read a dataframe from a file - with caching to improve performance
 @st.cache_data
-def read_spectral_file(file):
+def read_spectral_file(uploaded_file):
+    """
+    Reads a spectral data file (space-delimited) into a pandas DataFrame.
+    Caches the result to avoid re-reading the same file.
+
+    Args:
+        uploaded_file: A Streamlit UploadedFile object.
+
+    Returns:
+        pandas.DataFrame or None: DataFrame with 'Nanometers' and 'Counts' columns,
+                                  or None if reading fails or format is invalid.
+    """
+    if uploaded_file is None:
+        return None
     try:
-        return pd.read_csv(file, delim_whitespace=True)
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        return None
+        # Ensure reading from the start of the file
+        uploaded_file.seek(0)
+        # Read the file, trying space delimiter first, then comma
+        try:
+            df = pd.read_csv(uploaded_file, delim_whitespace=True)
+            if 'Nanometers' not in df.columns or 'Counts' not in df.columns:
+                 # If space didn't work, try comma
+                 uploaded_file.seek(0)
+                 df = pd.read_csv(uploaded_file) # Auto-detect delimiter (often comma)
+        except Exception: # Fallback to comma if space fails or raises error
+             uploaded_file.seek(0)
+             df = pd.read_csv(uploaded_file)
 
-# Function to create a small preview plot for uploaded files
-def create_preview_plot(df, title, color):
-    if df is None:
-        return None
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df['Nanometers'],
-        y=df['Counts'],
-        mode='lines',
-        line=dict(color=color)
-    ))
-    fig.update_layout(
-        title=title,
-        height=200,
-        margin=dict(l=0, r=0, t=30, b=0),
-        xaxis_title="Wavelength (nm)",
-        yaxis_title="Counts"
-    )
-    return fig
-
-# Function to average multiple dataframes with validation
-def average_dataframes(dataframes):
-    if not dataframes:
-        return None
-    
-    if any(df is None for df in dataframes):
-        st.error("One or more files could not be processed.")
-        return None
-    
-    # Check if all dataframes have the same wavelength points
-    wavelengths = dataframes[0]['Nanometers'].values
-    for df in dataframes[1:]:
-        if not np.array_equal(df['Nanometers'].values, wavelengths):
-            st.error("Wavelength values in files don't match. Please ensure all files have the same wavelength points.")
+        # --- Validation ---
+        if 'Nanometers' not in df.columns or 'Counts' not in df.columns:
+            st.error(f"File '{uploaded_file.name}' is missing required columns 'Nanometers' or 'Counts'. "
+                     "Please ensure the header is correct and columns are separated by spaces or commas.")
             return None
-    
-    # Create a new dataframe with the wavelengths
-    result = pd.DataFrame({'Nanometers': wavelengths})
-    
-    # Average the counts
-    counts_arrays = [df['Counts'].values for df in dataframes]
-    result['Counts'] = np.mean(counts_arrays, axis=0)
-    
-    return result
 
-# Function to process uploaded files with progress indication
-def process_file_uploads(files, file_type="data"):
-    if not files:
-        return None
-    
-    dataframes = []
-    
-    # Show a progress bar for file processing
-    progress_text = f"Processing {file_type} files..."
-    progress_bar = st.progress(0)
-    
-    for i, file in enumerate(files):
-        df = read_spectral_file(file)
-        if df is not None:
-            dataframes.append(df)
-            file.seek(0)  # Reset file position for potential later use
-        progress_bar.progress((i + 1) / len(files))
-    
-    progress_bar.empty()  # Remove progress bar when done
-    
-    if not dataframes:
-        return None
-        
-    return average_dataframes(dataframes)
+        # Ensure numeric types and handle potential errors
+        df['Nanometers'] = pd.to_numeric(df['Nanometers'], errors='coerce')
+        df['Counts'] = pd.to_numeric(df['Counts'], errors='coerce')
 
-# Function to get visible spectrum color based on wavelength (nm) - optimized with caching
+        # Check for conversion errors
+        if df['Nanometers'].isnull().any() or df['Counts'].isnull().any():
+            st.warning(f"File '{uploaded_file.name}' contains non-numeric data in 'Nanometers' or 'Counts' columns. "
+                       "Problematic rows were removed.")
+            df.dropna(subset=['Nanometers', 'Counts'], inplace=True)
+            if df.empty:
+                 st.error(f"File '{uploaded_file.name}' resulted in no valid data after cleaning.")
+                 return None
+
+        # Sort by wavelength just in case
+        df.sort_values(by='Nanometers', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        return df
+
+    except pd.errors.EmptyDataError:
+        st.error(f"File '{uploaded_file.name}' is empty.")
+        return None
+    except Exception as e:
+        st.error(f"Error reading file '{uploaded_file.name}': {e}. Check format (space or comma separated, 'Nanometers Counts' header).")
+        return None
+
 @st.cache_data
 def wavelength_to_rgb(wavelength):
-    """Convert wavelength in nm to RGB color using cached computation."""
-    # Define color ranges
+    """
+    Converts a wavelength (nm) to an approximate RGB color tuple (0-1 range).
+    Uses caching for performance.
+
+    Args:
+        wavelength (float): Wavelength in nanometers.
+
+    Returns:
+        tuple: (R, G, B) values, each between 0 and 1.
+    """
+    # Define color ranges based on wavelength
     if 380 <= wavelength < 440:  # Violet
-        R, G, B = (440 - wavelength) / 60, 0.0, 1.0
+        R, G, B = -(wavelength - 440) / (440 - 380), 0.0, 1.0
     elif 440 <= wavelength < 490:  # Blue
-        R, G, B = 0.0, (wavelength - 440) / 50, 1.0
+        R, G, B = 0.0, (wavelength - 440) / (490 - 440), 1.0
     elif 490 <= wavelength < 510:  # Cyan
-        R, G, B = 0.0, 1.0, (510 - wavelength) / 20
+        R, G, B = 0.0, 1.0, -(wavelength - 510) / (510 - 490)
     elif 510 <= wavelength < 580:  # Green
-        R, G, B = (wavelength - 510) / 70, 1.0, 0.0
+        R, G, B = (wavelength - 510) / (580 - 510), 1.0, 0.0
     elif 580 <= wavelength < 645:  # Yellow to Orange
-        R, G, B = 1.0, (645 - wavelength) / 65, 0.0
+        R, G, B = 1.0, -(wavelength - 645) / (645 - 580), 0.0
     elif 645 <= wavelength <= 780:  # Red
         R, G, B = 1.0, 0.0, 0.0
-    elif 340 <= wavelength < 380:  # Near UV (deep purple)
-        R, G, B = 0.4, 0.0, 0.8
-    elif 780 < wavelength <= 800:  # Near IR (deep red)
-        R, G, B = 0.8, 0.0, 0.0
-    else:  # Outside spectrum range
+    elif 340 <= wavelength < 380:  # Near UV (approx. deep purple) - Adjusted for visibility
+        R, G, B = 0.5 + (wavelength - 340) * 0.5 / 40, 0.0, 0.8 + (wavelength - 340) * 0.2 / 40 # Fade in
+    elif 780 < wavelength <= 800:  # Near IR (approx. deep red) - Adjusted for visibility
+        R, G, B = 0.8 + (800 - wavelength) * 0.2 / 20, 0.0, 0.0 # Fade out
+    else:  # Outside defined spectrum range (grey)
         R, G, B = 0.5, 0.5, 0.5
-    
-    # Apply intensity adjustment for edges of visible spectrum
+
+    # Apply intensity adjustment factor for edges of visible spectrum
+    factor = 1.0
     if 380 <= wavelength <= 780:
         if wavelength < 420:
             factor = 0.3 + 0.7 * (wavelength - 380) / 40
         elif wavelength > 700:
             factor = 0.3 + 0.7 * (780 - wavelength) / 80
-        else:
-            factor = 1.0
-        
-        R, G, B = R * factor, G * factor, B * factor
-    
+
+    # Ensure RGB values are within [0, 1] after applying factor
+    R = max(0.0, min(1.0, R * factor))
+    G = max(0.0, min(1.0, G * factor))
+    B = max(0.0, min(1.0, B * factor))
+
     return (R, G, B)
 
-# Function to convert wavelength to visible color name
 @st.cache_data
 def get_color_name(wavelength):
-    if 380 <= wavelength < 450:
-        return "Violet"
-    elif 450 <= wavelength < 485:
-        return "Blue"
-    elif 485 <= wavelength < 500:
-        return "Cyan"
-    elif 500 <= wavelength < 565:
-        return "Green"
-    elif 565 <= wavelength < 590:
-        return "Yellow"
-    elif 590 <= wavelength < 625:
-        return "Orange"
-    elif 625 <= wavelength <= 780:
-        return "Red"
-    elif wavelength < 380:
-        return "Near UV"
+    """
+    Returns the approximate color name for a given wavelength (nm).
+    Uses caching for performance.
+
+    Args:
+        wavelength (float): Wavelength in nanometers.
+
+    Returns:
+        str: Name of the spectral region (e.g., "Violet", "Green", "Near IR").
+    """
+    if wavelength < 380: return "Near UV"
+    elif 380 <= wavelength < 450: return "Violet"
+    elif 450 <= wavelength < 485: return "Blue"
+    elif 485 <= wavelength < 500: return "Cyan"
+    elif 500 <= wavelength < 565: return "Green"
+    elif 565 <= wavelength < 590: return "Yellow"
+    elif 590 <= wavelength < 625: return "Orange"
+    elif 625 <= wavelength <= 780: return "Red"
+    else: return "Near IR"
+
+# --- Data Processing Functions ---
+
+def average_dataframes(dataframes, file_type_label):
+    """
+    Averages the 'Counts' column across multiple DataFrames.
+    Validates that all DataFrames have matching 'Nanometers' columns.
+
+    Args:
+        dataframes (list): A list of valid pandas DataFrames to average.
+        file_type_label (str): Label for the type of files being averaged (e.g., "Reference").
+
+    Returns:
+        pandas.DataFrame or None: A new DataFrame with averaged 'Counts',
+                                  or None if validation fails or input is empty/invalid.
+    """
+    if not dataframes:
+        # This case should ideally be handled before calling, but added for safety
+        st.warning(f"No valid {file_type_label} dataframes provided for averaging.")
+        return None
+
+    # Use the first dataframe's wavelengths and shape as the reference
+    reference_df = dataframes[0]
+    reference_wavelengths = reference_df['Nanometers'].values
+    reference_shape = reference_df.shape
+
+    # Validate other dataframes
+    for i, df in enumerate(dataframes[1:], 1):
+        if df.shape != reference_shape or not np.array_equal(df['Nanometers'].values, reference_wavelengths):
+            st.error(f"Wavelength values or data shape in {file_type_label} file {i+1} "
+                     f"(starting from the second file) do not match the first {file_type_label} file. "
+                     f"Please ensure all files within a category (Reference, Sample, Dark) "
+                     f"have the exact same wavelength points and structure.")
+            return None
+
+    # Create a new dataframe with the reference wavelengths
+    result_df = pd.DataFrame({'Nanometers': reference_wavelengths})
+
+    # Average the 'Counts'
+    try:
+        # Stack counts vertically and calculate mean along axis 0
+        counts_arrays = np.vstack([df['Counts'].values for df in dataframes])
+        result_df['Counts'] = np.mean(counts_arrays, axis=0)
+    except Exception as e:
+        st.error(f"Error during averaging of {file_type_label} data: {e}")
+        return None
+
+    return result_df
+
+def process_file_uploads(uploaded_files, file_type_label):
+    """
+    Reads multiple uploaded files, validates them, averages if multiple, and shows progress.
+
+    Args:
+        uploaded_files (list): List of Streamlit UploadedFile objects.
+        file_type_label (str): Description of the files being processed (e.g., "Reference").
+
+    Returns:
+        pandas.DataFrame or None: Processed (potentially averaged) DataFrame,
+                                  or None if no valid files are processed.
+    """
+    if not uploaded_files:
+        return None # No files uploaded for this type
+
+    valid_dataframes = []
+    # Use a placeholder for the progress bar if needed later
+    # progress_bar_placeholder = st.empty()
+    # progress_text = f"Processing {len(uploaded_files)} {file_type_label} file(s)..."
+
+    for i, file in enumerate(uploaded_files):
+        # Read each file using the cached function
+        df = read_spectral_file(file)
+        if df is not None:
+            valid_dataframes.append(df)
+        # Update progress (optional, can make UI busy if updates too fast)
+        # progress_bar_placeholder.progress((i + 1) / len(uploaded_files), text=progress_text)
+
+    # progress_bar_placeholder.empty() # Remove progress bar
+
+    if not valid_dataframes:
+        st.error(f"No valid {file_type_label} files could be read or processed.")
+        return None
+
+    # Average if more than one valid file was read
+    if len(valid_dataframes) > 1:
+        st.info(f"Averaging {len(valid_dataframes)} {file_type_label} files...")
+        averaged_df = average_dataframes(valid_dataframes, file_type_label)
+        return averaged_df # Returns None if averaging fails
     else:
-        return "Near IR"
+        # Only one valid file, return it directly
+        return valid_dataframes[0]
 
-# Function to find absorption peaks
-def find_absorption_peaks(wavelengths, absorbances, min_height=0.1, min_distance=15, min_prominence=0.05):
-    """Find absorption peaks in spectral data."""
+def calculate_absorbance(df_reference, df_sample, df_dark=None, path_length_cm=1.0):
+    """
+    Calculates absorbance based on reference, sample, and optional dark spectra.
+
+    Args:
+        df_reference (pd.DataFrame): Processed (averaged) reference spectrum.
+        df_sample (pd.DataFrame): Processed (averaged) sample spectrum.
+        df_dark (pd.DataFrame, optional): Processed (averaged) dark spectrum. Defaults to None.
+        path_length_cm (float): Optical path length in centimeters.
+
+    Returns:
+        pd.DataFrame or None: DataFrame containing wavelengths, raw counts,
+                              corrected counts, absorbance, and absorbance per cm,
+                              or None if input validation fails.
+    """
+    # --- Input Validation ---
+    if df_reference is None or df_sample is None:
+        # Errors handled during file processing, so just return None here
+        return None
+
+    # Check wavelength consistency between reference and sample
+    if not np.array_equal(df_reference['Nanometers'].values, df_sample['Nanometers'].values):
+        st.error("Wavelength mismatch between Reference and Sample data. "
+                 "Ensure all uploaded files (Reference, Sample, Dark) share the exact same wavelength points.")
+        return None
+
+    # Check wavelength consistency with dark spectrum if provided
+    if df_dark is not None and not np.array_equal(df_reference['Nanometers'].values, df_dark['Nanometers'].values):
+        st.error("Wavelength mismatch between Dark data and Reference/Sample data. "
+                 "Ensure all uploaded files (Reference, Sample, Dark) share the exact same wavelength points.")
+        return None
+
+    # --- Calculations ---
+    df_result = pd.DataFrame({'Nanometers': df_reference['Nanometers']})
+    df_result['Reference_Counts'] = df_reference['Counts']
+    df_result['Sample_Counts'] = df_sample['Counts']
+
+    # Determine dark counts (use zero if no dark spectrum provided)
+    if df_dark is not None:
+        dark_counts = df_dark['Counts'].values # Use numpy array for subtraction
+        df_result['Dark_Counts'] = dark_counts
+    else:
+        dark_counts = 0 # Scalar zero, broadcasts correctly
+
+    # Apply dark correction and clipping (prevent non-positive values for log)
+    reference_corrected = np.clip(df_result['Reference_Counts'].values - dark_counts, a_min=EPSILON, a_max=None)
+    sample_corrected = np.clip(df_result['Sample_Counts'].values - dark_counts, a_min=EPSILON, a_max=None)
+
+    df_result['Reference_Corrected'] = reference_corrected
+    df_result['Sample_Corrected'] = sample_corrected
+
+    # Calculate Absorbance: A = log10(I₀ / I) = log10(Reference_Corrected / Sample_Corrected)
+    # Handle potential division by zero or invalid values gracefully
+    with np.errstate(divide='ignore', invalid='ignore'): # Suppress warnings during calculation
+        absorbance = np.log10(reference_corrected / sample_corrected)
+        # Replace NaNs or Infs resulting from division issues with 0 or np.nan
+        absorbance[~np.isfinite(absorbance)] = 0 # Replace with 0 for plotting continuity
+
+    df_result['Absorbance'] = absorbance
+
+    # Calculate absorbance normalized by path length
+    if path_length_cm is not None and path_length_cm > 0:
+        df_result['Absorbance_per_cm'] = df_result['Absorbance'] / path_length_cm
+    else:
+        # Assign NaN or keep column absent if path length is invalid/zero
+        df_result['Absorbance_per_cm'] = np.nan
+        if path_length_cm == 0:
+            st.warning("Path length is zero, cannot calculate Absorbance per cm.")
+        # If path_length_cm is None, it means input was invalid, warning shown elsewhere
+
+    return df_result
+
+def apply_savitzky_golay(data, window_length, poly_order):
+    """
+    Applies Savitzky-Golay filter to the data. Includes basic validation.
+
+    Args:
+        data (np.array): The data series to smooth.
+        window_length (int): The length of the filter window (must be odd).
+        poly_order (int): The order of the polynomial used to fit the samples.
+
+    Returns:
+        np.array or None: The smoothed data, or None if parameters are invalid or error occurs.
+    """
+    # Basic validation (more robust checks in UI)
+    if not isinstance(window_length, int) or window_length <= 0 or window_length % 2 == 0:
+        st.warning(f"Savitzky-Golay: Window Length ({window_length}) must be a positive odd integer. Skipping smoothing.")
+        return None
+    if not isinstance(poly_order, int) or poly_order < 0:
+         st.warning(f"Savitzky-Golay: Polynomial Order ({poly_order}) must be a non-negative integer. Skipping smoothing.")
+         return None
+    if poly_order >= window_length:
+        st.warning(f"Savitzky-Golay: Polynomial Order ({poly_order}) must be less than Window Length ({window_length}). Skipping smoothing.")
+        return None
+    if len(data) < window_length:
+        st.warning(f"Savitzky-Golay: Data length ({len(data)}) is shorter than Window Length ({window_length}). Skipping smoothing.")
+        return None
+
+    try:
+        smoothed_data = savgol_filter(data, window_length, poly_order)
+        return smoothed_data
+    except Exception as e:
+        st.error(f"Error applying Savitzky-Golay filter: {e}")
+        return None
+
+def find_absorption_peaks(wavelengths, absorbances, min_height=0.1, min_distance_nm=15, min_prominence=0.05):
+    """
+    Finds absorption peaks in spectral data using scipy.signal.find_peaks.
+    Operates on the provided full arrays. Filtering by range happens later.
+
+    Args:
+        wavelengths (np.array): Array of wavelengths.
+        absorbances (np.array): Array of corresponding absorbance values.
+        min_height (float): Minimum height threshold for a peak (absolute absorbance).
+        min_distance_nm (float): Minimum required horizontal distance (in nm) between peaks.
+        min_prominence (float): Minimum required prominence of a peak.
+
+    Returns:
+        tuple: (peak_indices, properties) as returned by find_peaks, or ([], {}) if error/no peaks.
+               Returns None if input is invalid.
+    """
+    if wavelengths is None or absorbances is None or len(wavelengths) != len(absorbances) or len(wavelengths) < 3:
+        st.warning("Peak Finding: Insufficient or mismatched data provided.")
+        return None # Indicate invalid input
+
+    # Ensure parameters are valid numbers
+    if not all(isinstance(p, (int, float)) and np.isfinite(p) for p in [min_height, min_distance_nm, min_prominence]):
+         st.warning("Peak Finding: Invalid non-numeric parameter provided (Min Height, Distance, or Prominence).")
+         return None
+
+    if min_distance_nm <= 0:
+         st.warning("Peak Finding: Minimum Peak Distance must be positive.")
+         return None # Or default to 1 point distance? Returning None seems safer.
+
     # Convert min_distance from nm to number of data points
-    avg_spacing = np.mean(np.diff(wavelengths))
-    distance_points = int(min_distance / avg_spacing) if avg_spacing > 0 else 15
-    
-    # Find peaks on the absorbance data
-    peak_indices, _ = find_peaks(
-        absorbances, 
-        height=min_height, 
-        distance=distance_points,
-        prominence=min_prominence
-    )
-    
-    # Return wavelengths and absorbances at peak locations
-    return [(wavelengths[i], absorbances[i]) for i in peak_indices]
+    diffs = np.diff(wavelengths)
+    if np.all(diffs <= 0): # Handle non-increasing wavelengths
+        avg_spacing = 1.0 # Avoid division by zero, assume unit spacing
+        st.warning("Peak Finding: Wavelengths are not strictly increasing. Distance calculation might be inaccurate.")
+    else:
+        avg_spacing = np.mean(diffs[diffs > 0]) # Use only positive differences
+        if avg_spacing <= 0: # Should not happen if diffs > 0 exists, but safety check
+             avg_spacing = 1.0
 
-# Function to create a base plot configuration
-def create_base_plot(title, x_label, y_label):
+    distance_points = max(1, int(round(min_distance_nm / avg_spacing))) # Ensure at least 1 point distance
+
+    try:
+        peak_indices, properties = find_peaks(
+            absorbances,
+            height=min_height if min_height > -np.inf else None, # find_peaks needs None for no threshold
+            distance=distance_points,
+            prominence=min_prominence if min_prominence > 0 else None # find_peaks needs None for no threshold
+        )
+        return peak_indices, properties
+    except Exception as e:
+        st.error(f"Error during peak finding: {e}")
+        return None # Indicate error
+
+# --- Plotting Functions ---
+
+def create_preview_plot(df, title, color):
+    """Creates a small Plotly figure for previewing uploaded file data."""
+    fig = go.Figure()
+    if df is None or df.empty:
+        # Show a message within the plot area
+        fig.update_layout(
+            title=f"{title} (No data)",
+            height=150, # Smaller height for preview
+            margin=dict(l=0, r=0, t=30, b=0),
+            xaxis={'visible': False}, # Hide axes
+            yaxis={'visible': False},
+            annotations=[{
+                'text': "No data to display",
+                'xref': "paper", 'yref': "paper",
+                'x': 0.5, 'y': 0.5, 'showarrow': False
+            }]
+        )
+        return fig
+
+    fig.add_trace(go.Scatter(
+        x=df['Nanometers'],
+        y=df['Counts'],
+        mode='lines',
+        line=dict(color=color, width=1.5), # Thinner line for preview
+        name='Counts'
+    ))
+    fig.update_layout(
+        title=title,
+        height=150, # Smaller height
+        margin=dict(l=10, r=10, t=30, b=10), # Minimal margins
+        xaxis_title=None, # Hide axis titles for preview
+        yaxis_title=None,
+        xaxis=dict(showticklabels=False), # Hide tick labels
+        yaxis=dict(showticklabels=False),
+        hovermode='x unified',
+        showlegend=False # Hide legend for preview
+    )
+    return fig
+
+def create_base_plot(title, x_label, y_label, x_range=None):
+    """Creates a base Plotly figure configuration."""
     fig = go.Figure()
     fig.update_layout(
         title=title,
         xaxis_title=x_label,
         yaxis_title=y_label,
-        xaxis=dict(range=[SPECTRUM_MIN, SPECTRUM_MAX]),
-        hovermode='closest',
-        height=600
+        xaxis=dict(range=x_range if x_range else None), # Apply range if provided
+        hovermode='x unified',
+        height=500, # Standard height for main plots
+        legend=dict(
+            orientation="h", # Horizontal legend
+            yanchor="bottom", y=1.02, # Position above plot
+            xanchor="right", x=1
+        ),
+        margin=dict(t=80) # Increased top margin for title and legend
     )
     return fig
 
-# Set up the UI layout
-st.subheader("File Upload")
-col1, col2 = st.columns(2)
+def plot_raw_counts(df_plot, dark_counts_plot=None, x_range=None):
+    """Plots Raw Reference, Sample, and optional Dark Counts within the specified x_range."""
+    fig = create_base_plot(
+        title='Raw Detector Counts vs Wavelength',
+        x_label='Wavelength (nm)',
+        y_label='Counts',
+        x_range=x_range # Pass the range to the base plot creator
+    )
+    # Use 'visible="legendonly"' to hide traces initially but keep them in legend
+    fig.add_trace(go.Scatter(
+        x=df_plot['Nanometers'], y=df_plot['Reference_Counts'], mode='lines',
+        name='Reference', line=dict(color='dodgerblue'), # Changed color slightly
+        hovertemplate='Ref W: %{x:.1f} nm<br>Counts: %{y:,.0f}<extra></extra>' # Formatted counts
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_plot['Nanometers'], y=df_plot['Sample_Counts'], mode='lines',
+        name='Sample', line=dict(color='mediumseagreen'), # Changed color slightly
+        hovertemplate='Sample W: %{x:.1f} nm<br>Counts: %{y:,.0f}<extra></extra>'
+    ))
+    if dark_counts_plot is not None and not dark_counts_plot.empty:
+        fig.add_trace(go.Scatter(
+            x=df_plot['Nanometers'], y=dark_counts_plot, mode='lines',
+            name='Dark', line=dict(color='black', dash='dot'), # Dotted line for dark
+            hovertemplate='Dark W: %{x:.1f} nm<br>Counts: %{y:,.0f}<extra></extra>',
+            visible='legendonly' # Hide dark counts by default
+        ))
+    return fig
 
-# File upload sections
-with col1:
-    st.markdown("### Reference (Blank) Files")
-    reference_files = st.file_uploader("Upload reference/blank measurements", type=["txt", "csv"], key="reference", accept_multiple_files=True)
-    
-    if reference_files:
-        st.info(f"{len(reference_files)} reference files uploaded. These will be averaged.")
-        
-        # Preview first file
-        if len(reference_files) > 0:
-            try:
-                df_reference_preview = read_spectral_file(reference_files[0])
-                reference_files[0].seek(0)
-                if df_reference_preview is not None:
-                    st.plotly_chart(create_preview_plot(df_reference_preview, "First Reference File Preview", "blue"), use_container_width=True)
-            except Exception as e:
-                st.error(f"Error previewing reference file: {e}")
+def plot_corrected_counts(df_plot, x_range=None):
+    """Plots Dark-Corrected Reference and Sample Counts within the specified x_range."""
+    fig = create_base_plot(
+        title='Dark-Corrected Counts vs Wavelength',
+        x_label='Wavelength (nm)',
+        y_label='Counts (Dark Corrected)',
+        x_range=x_range # Pass the range to the base plot creator
+    )
+    fig.add_trace(go.Scatter(
+        x=df_plot['Nanometers'], y=df_plot['Reference_Corrected'], mode='lines',
+        name='Reference (Corrected)', line=dict(color='dodgerblue'),
+        hovertemplate='Ref Corrected W: %{x:.1f} nm<br>Counts: %{y:,.2f}<extra></extra>'
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_plot['Nanometers'], y=df_plot['Sample_Corrected'], mode='lines',
+        name='Sample (Corrected)', line=dict(color='mediumseagreen'),
+        hovertemplate='Sample Corrected W: %{x:.1f} nm<br>Counts: %{y:,.2f}<extra></extra>'
+    ))
+    return fig
 
-with col2:
-    st.markdown("### Sample Files")
-    sample_files = st.file_uploader("Upload sample measurements", type=["txt", "csv"], key="sample", accept_multiple_files=True)
-    
-    if sample_files:
-        st.info(f"{len(sample_files)} sample files uploaded. These will be averaged.")
-        
-        # Preview first file
-        if len(sample_files) > 0:
-            try:
-                df_sample_preview = read_spectral_file(sample_files[0])
-                sample_files[0].seek(0)
-                if df_sample_preview is not None:
-                    st.plotly_chart(create_preview_plot(df_sample_preview, "First Sample File Preview", "green"), use_container_width=True)
-            except Exception as e:
-                st.error(f"Error previewing sample file: {e}")
+def plot_absorbance(df_plot, path_length_mm, absorption_peaks_info, smoothed_absorbance=None, x_range=None):
+    """
+    Plots Absorbance vs Wavelength with a gradient fill under the curve,
+    optionally with smoothed data and peaks, respecting the x_range.
 
-# Optional dark spectrum for background correction
-dark_expander = st.expander("Advanced: Dark Spectrum Correction (Optional)")
-with dark_expander:
-    st.markdown("""
-    If you have a dark spectrum measurement (detector response with no light), 
-    upload it below for more accurate absorbance calculation.
-    """)
-    dark_files = st.file_uploader("Upload dark spectrum files (optional)", type=["txt", "csv"], key="dark", accept_multiple_files=True)
-    
-    if dark_files:
-        st.info(f"{len(dark_files)} dark files uploaded. These will be averaged.")
-        
-        # Preview first file
-        if len(dark_files) > 0:
-            try:
-                df_dark_preview = read_spectral_file(dark_files[0])
-                dark_files[0].seek(0)
-                if df_dark_preview is not None:
-                    st.plotly_chart(create_preview_plot(df_dark_preview, "First Dark Spectrum Preview", "black"), use_container_width=True)
-            except Exception as e:
-                st.error(f"Error previewing dark file: {e}")
+    Args:
+        df_plot (pd.DataFrame): DataFrame containing 'Nanometers', 'Absorbance'.
+        path_length_mm (float): Path length in mm (for title).
+        absorption_peaks_info (tuple or None): Result from find_absorption_peaks (indices, properties), or None.
+        smoothed_absorbance (np.array, optional): Smoothed absorbance data.
+        x_range (list, optional): X-axis range [min, max] to display.
 
-# Add path length input (default 10mm)
-path_length = st.number_input("Path length (mm):", min_value=0.1, max_value=100.0, value=10.0, step=0.1)
-path_length_cm = path_length / 10  # Convert to cm for calculations
+    Returns:
+        plotly.graph_objects.Figure: The generated plot.
+    """
+    path_length_text = f"{path_length_mm:.2f} mm" if path_length_mm is not None else "N/A"
+    fig = create_base_plot(
+        title=f'Absorbance vs Wavelength (Path Length: {path_length_text})',
+        x_label='Wavelength (nm)',
+        y_label='Absorbance (AU)', # AU = Absorbance Units
+        x_range=x_range # Pass the range to the base plot creator
+    )
 
-# Add peak detection settings
-peak_settings_expander = st.expander("Peak Detection Settings")
-with peak_settings_expander:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        peak_height = st.number_input("Minimum peak height:", min_value=0.01, max_value=5.0, value=0.1, step=0.01, 
-                                     help="Minimum height required for a peak to be identified")
-    with col2:
-        peak_distance = st.number_input("Minimum peak distance (nm):", min_value=5, max_value=100, value=15, step=5,
-                                       help="Minimum distance between peaks in nanometers")
-    with col3:
-        peak_prominence = st.number_input("Minimum peak prominence:", min_value=0.01, max_value=2.0, value=0.05, step=0.01,
-                                         help="Required prominence of peaks (higher values give fewer peaks)")
+    wavelengths = df_plot['Nanometers'].values
+    absorbances = df_plot['Absorbance'].values
 
-# Process the uploaded files
-if reference_files and sample_files:
-    try:
-        with st.spinner("Processing files..."):
-            # Process files using our optimized function
-            df_reference = process_file_uploads(reference_files, "reference")
-            if df_reference is None:
-                st.error("Could not process reference files.")
-                st.stop()
-                
-            df_sample = process_file_uploads(sample_files, "sample")
-            if df_sample is None:
-                st.error("Could not process sample files.")
-                st.stop()
-            
-            # Process dark files if provided
-            if dark_files:
-                df_dark = process_file_uploads(dark_files, "dark")
-                if df_dark is None:
-                    st.error("Could not process dark files.")
-                    st.stop()
-                
-                dark_counts = df_dark['Counts']
-            else:
-                # If no dark file, assume zero dark counts
-                dark_counts = pd.Series(0, index=range(len(df_reference)))
-            
-            # Verify wavelength alignment between reference and sample
-            if not np.array_equal(df_reference['Nanometers'], df_sample['Nanometers']):
-                st.error("Wavelength values in reference and sample files don't match.")
-                st.stop()
-                
-            # Create results dataframe
-            df_result = pd.DataFrame({
-                'Nanometers': df_reference['Nanometers'],
-                'Reference_Counts': df_reference['Counts'],
-                'Sample_Counts': df_sample['Counts']
-            })
-            
-            # Apply dark correction
-            reference_corrected = (df_reference['Counts'] - dark_counts).clip(lower=EPSILON)
-            sample_corrected = (df_sample['Counts'] - dark_counts).clip(lower=EPSILON)
-            
-            df_result['Reference_Corrected'] = reference_corrected
-            df_result['Sample_Corrected'] = sample_corrected
-            
-            # Calculate absorbance: A = log10(I₀/I)
-            df_result['Absorbance'] = np.log10(reference_corrected / sample_corrected)
-            
-            # Calculate absorbance adjusted for path length
-            df_result['Absorbance_per_cm'] = df_result['Absorbance'] / path_length_cm
-            
-            # Add averaging info
-            averaging_info = f"""
-            ### Averaging Information
-            - {len(reference_files)} reference files averaged
-            - {len(sample_files)} sample files averaged
-            """
-            if dark_files:
-                averaging_info += f"- {len(dark_files)} dark files averaged"
-            
-            st.markdown(averaging_info)
-            
-            # Show the processed data
-            st.subheader("Processed Data")
-            st.dataframe(df_result)
-            
-            # Create interactive plots with Plotly
-            st.subheader("Visualization")
-            tab1, tab2, tab3 = st.tabs(["Raw Counts", "Corrected Counts", "Absorbance"])
-            
-            # Filter data to the required wavelength range for visualization
-            df_plot = df_result[(df_result['Nanometers'] >= SPECTRUM_MIN) & 
-                                (df_result['Nanometers'] <= SPECTRUM_MAX)].copy()
-            
-            with tab1:
-                fig1 = create_base_plot(
-                    title=f'Raw Counts vs Wavelength ({SPECTRUM_MIN}-{SPECTRUM_MAX} nm)',
-                    x_label='Wavelength (nm)',
-                    y_label='Counts'
-                )
-                
-                fig1.add_trace(go.Scatter(
-                    x=df_plot['Nanometers'], 
-                    y=df_plot['Reference_Counts'],
-                    mode='lines',
-                    name='Reference',
-                    line=dict(color='blue'),
-                    hovertemplate='Wavelength: %{x:.1f} nm<br>Counts: %{y:.2f}<extra></extra>'
+    # --- Add Gradient Fill using Segments ---
+    num_segments = 100 # Adjust for balance between color detail and performance
+    # Create segments based on the full data range first
+    indices = np.linspace(0, len(wavelengths) - 1, num_segments + 1, dtype=int)
+
+    for i in range(num_segments):
+        start_idx, end_idx = indices[i], indices[i+1]
+        if end_idx <= start_idx: continue
+
+        segment_wl = wavelengths[start_idx : end_idx + 1]
+        segment_abs = absorbances[start_idx : end_idx + 1]
+
+        # Get color based on the midpoint wavelength of the segment
+        mid_wavelength = segment_wl[len(segment_wl) // 2]
+        rgb = wavelength_to_rgb(mid_wavelength)
+        color = f'rgba({int(rgb[0]*255)}, {int(rgb[1]*255)}, {int(rgb[2]*255)}, 0.6)' # Slightly transparent
+
+        fig.add_trace(go.Scatter(
+            x=segment_wl,
+            y=segment_abs,
+            mode='lines',
+            fill='tozeroy',
+            fillcolor=color,
+            line=dict(color='rgba(0,0,0,0)', width=0), # Invisible line for segment
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+
+    # --- Add Invisible Line for Hover and Legend Entry (Full Data) ---
+    color_names = [get_color_name(wl) for wl in wavelengths]
+    custom_data = np.stack((color_names,), axis=-1)
+
+    fig.add_trace(go.Scatter(
+        x=wavelengths,
+        y=absorbances,
+        mode='lines',
+        name='Absorbance',
+        line=dict(color='rgba(0,0,0,0)', width=0), # Invisible line
+        customdata=custom_data,
+        hovertemplate=(
+            '<b>%{customdata[0]}</b><br>'
+            'Wavelength: %{x:.1f} nm<br>'
+            'Absorbance: %{y:.4f} AU<extra></extra>'
+        ),
+        showlegend=True
+    ))
+
+    # --- Add Smoothed Absorbance Line (if available) ---
+    if smoothed_absorbance is not None and len(smoothed_absorbance) == len(wavelengths):
+         smoothed_custom_data = np.stack(([get_color_name(wl) for wl in wavelengths],), axis=-1)
+         fig.add_trace(go.Scatter(
+            x=wavelengths,
+            y=smoothed_absorbance,
+            mode='lines',
+            name='Smoothed Absorbance',
+            line=dict(color='purple', width=1.5, dash='dash'),
+            customdata=smoothed_custom_data,
+            hovertemplate=(
+                '<b>%{customdata[0]} (Smoothed)</b><br>'
+                'Wavelength: %{x:.1f} nm<br>'
+                'Smoothed Abs: %{y:.4f} AU<extra></extra>'
+            ),
+            visible='legendonly'
+         ))
+
+    # --- Add Peak Markers and Labels (Filtered by x_range) ---
+    peak_count_total = 0
+    peak_count_displayed = 0
+    if absorption_peaks_info is not None:
+        peak_indices, properties = absorption_peaks_info
+        peak_count_total = len(peak_indices)
+
+        if peak_count_total > 0:
+            # Determine which y-values to use for peak markers (raw or smoothed)
+            peak_y_values = smoothed_absorbance if (smoothed_absorbance is not None and st.session_state.get('peak_source_label') == "Smoothed Absorbance") else absorbances
+
+            all_peak_x = wavelengths[peak_indices]
+            all_peak_y = peak_y_values[peak_indices]
+            all_peak_prominences = properties.get('prominences', [None]*peak_count_total)
+            all_peak_heights = properties.get('peak_heights', all_peak_y)
+
+            # Filter peaks based on the plot's x_range
+            display_peaks_mask = np.ones(peak_count_total, dtype=bool)
+            if x_range:
+                min_wl, max_wl = x_range
+                display_peaks_mask = (all_peak_x >= min_wl) & (all_peak_x <= max_wl)
+
+            peak_x = all_peak_x[display_peaks_mask]
+            peak_y = all_peak_y[display_peaks_mask]
+            peak_prominences = [p for p, m in zip(all_peak_prominences, display_peaks_mask) if m]
+            peak_heights = [h for h, m in zip(all_peak_heights, display_peaks_mask) if m]
+            peak_count_displayed = len(peak_x)
+
+            if peak_count_displayed > 0:
+                peak_hover_texts = [
+                    f'<b>Peak</b><br>'
+                    f'Wavelength: {px:.1f} nm<br>'
+                    f'Absorbance: {py:.4f} AU<br>'
+                    f'Height: {ph:.4f} AU<br>' +
+                    (f'Prominence: {pp:.4f} AU' if pp is not None else '') +
+                    '<extra></extra>'
+                    for px, py, ph, pp in zip(peak_x, peak_y, peak_heights, peak_prominences)
+                ]
+
+                fig.add_trace(go.Scatter(
+                    x=peak_x, y=peak_y, mode='markers',
+                    marker=dict(size=8, color='red', symbol='x', line=dict(width=1, color='darkred')),
+                    name=f'Peaks ({peak_count_displayed})', # Show count in range
+                    hovertemplate=peak_hover_texts
                 ))
-                
-                fig1.add_trace(go.Scatter(
-                    x=df_plot['Nanometers'], 
-                    y=df_plot['Sample_Counts'],
-                    mode='lines',
-                    name='Sample',
-                    line=dict(color='green'),
-                    hovertemplate='Wavelength: %{x:.1f} nm<br>Counts: %{y:.2f}<extra></extra>'
-                ))
-                
-                if dark_files:
-                    # Filter dark counts to the same range
-                    dark_counts_plot = dark_counts.iloc[df_plot.index]
-                    fig1.add_trace(go.Scatter(
-                        x=df_plot['Nanometers'], 
-                        y=dark_counts_plot,
-                        mode='lines',
-                        name='Dark',
-                        line=dict(color='black'),
-                        hovertemplate='Wavelength: %{x:.1f} nm<br>Counts: %{y:.2f}<extra></extra>'
-                    ))
-                
-                st.plotly_chart(fig1, use_container_width=True)
-            
-            with tab2:
-                fig2 = create_base_plot(
-                    title=f'Dark-Corrected Counts vs Wavelength ({SPECTRUM_MIN}-{SPECTRUM_MAX} nm)',
-                    x_label='Wavelength (nm)',
-                    y_label='Counts (Dark Corrected)'
-                )
-                
-                fig2.add_trace(go.Scatter(
-                    x=df_plot['Nanometers'], 
-                    y=df_plot['Reference_Corrected'],
-                    mode='lines',
-                    name='Reference (Corrected)',
-                    line=dict(color='blue'),
-                    hovertemplate='Wavelength: %{x:.1f} nm<br>Counts: %{y:.2f}<extra></extra>'
-                ))
-                
-                fig2.add_trace(go.Scatter(
-                    x=df_plot['Nanometers'], 
-                    y=df_plot['Sample_Corrected'],
-                    mode='lines',
-                    name='Sample (Corrected)',
-                    line=dict(color='green'),
-                    hovertemplate='Wavelength: %{x:.1f} nm<br>Counts: %{y:.2f}<extra></extra>'
-                ))
-                
-                st.plotly_chart(fig2, use_container_width=True)
-            
-            with tab3:
-                # Create the absorbance plot
-                fig3 = create_base_plot(
-                    title=f'Absorbance vs Wavelength ({SPECTRUM_MIN}-{SPECTRUM_MAX} nm, path length = {path_length} mm)',
-                    x_label='Wavelength (nm)',
-                    y_label='Absorbance'
-                )
-                
-                wavelengths = df_plot['Nanometers'].values
-                absorbances = df_plot['Absorbance'].values
-                
-                # Create colored segments for the entire range - optimized to reduce iterations
-                # Group wavelengths in chunks to reduce number of traces
-                chunk_size = max(1, len(wavelengths) // 100)  # Limit to around 100 segments
-                for j in range(0, len(wavelengths) - chunk_size, chunk_size):
-                    end_idx = min(j + chunk_size, len(wavelengths) - 1)
-                    chunk_wavelengths = wavelengths[j:end_idx+1]
-                    chunk_absorbances = absorbances[j:end_idx+1]
-                    
-                    # Get color based on average wavelength of chunk
-                    avg_wavelength = np.mean(chunk_wavelengths)
-                    rgb = wavelength_to_rgb(avg_wavelength)
-                    color = f'rgb({int(rgb[0]*255)}, {int(rgb[1]*255)}, {int(rgb[2]*255)})'
-                    
-                    fig3.add_trace(go.Scatter(
-                        x=chunk_wavelengths,
-                        y=chunk_absorbances,
-                        mode='lines',
-                        line=dict(color=color, width=3),
-                        showlegend=False,
-                        hoverinfo='skip'
-                    ))
-                
-                # Add a line for hover info
-                fig3.add_trace(go.Scatter(
-                    x=wavelengths,
-                    y=absorbances,
-                    mode='lines',
-                    name='Absorbance',
-                    line=dict(color='rgba(0,0,0,0.2)', width=1),
-                    hovertemplate='Wavelength: %{x:.1f} nm<br>Absorbance: %{y:.4f}<extra></extra>'
-                ))
-                
-                # Find absorption peaks
-                absorption_peaks = find_absorption_peaks(
-                    wavelengths, 
-                    absorbances,
-                    min_height=peak_height,
-                    min_distance=peak_distance,
-                    min_prominence=peak_prominence
-                )
-                
-                # Add peak markers and labels
-                if absorption_peaks:
-                    peak_x = [peak[0] for peak in absorption_peaks]
-                    peak_y = [peak[1] for peak in absorption_peaks]
-                    
-                    # Add peak points
-                    fig3.add_trace(go.Scatter(
-                        x=peak_x,
-                        y=peak_y,
-                        mode='markers',
-                        marker=dict(size=8, color='red', symbol='diamond'),
-                        name='Absorption Peaks',
-                        hovertemplate='Peak: %{x:.1f} nm<br>Absorbance: %{y:.4f}<extra></extra>'
-                    ))
-                    
-                    # Add peak labels
-                    for x, y in zip(peak_x, peak_y):
-                        fig3.add_annotation(
-                            x=x, y=y + 0.05,
-                            text=f"{x:.1f} nm",
-                            showarrow=True,
-                            arrowhead=2,
-                            arrowsize=1, 
-                            arrowwidth=1,
-                            arrowcolor="black",
-                            ax=0,
-                            ay=-30
-                        )
-                
-                # Show number of peaks found
-                peak_count_text = f"{len(absorption_peaks)} absorption peak{'s' if len(absorption_peaks) != 1 else ''} detected"
-                fig3.update_layout(title=f"{fig3.layout.title.text}<br><sub>{peak_count_text}</sub>")
-                
-                # Add a vertical band showing the visible spectrum range
-                fig3.add_shape(
-                    type="rect",
-                    x0=380, y0=0,
-                    x1=780, y1=1,
-                    yref="paper",
-                    fillcolor="rgba(200,200,200,0.005)",
-                    line=dict(width=0),
-                    layer="below"
-                )
-                
-                # Add annotation for visible spectrum
-                fig3.add_annotation(
-                    x=(380+780)/2, y=0.03,
-                    yref="paper",
-                    text="Visible Spectrum (380-780 nm)",
-                    showarrow=False,
-                    font=dict(size=10)
-                )
-                
-                st.plotly_chart(fig3, use_container_width=True)
-                
-                # Create a table of detected peaks
-                if absorption_peaks:
-                    st.subheader("Absorption Peaks")
-                    
-                    # Create a dataframe for the peaks
-                    peaks_df = pd.DataFrame(absorption_peaks, columns=['Wavelength (nm)', 'Absorbance'])
-                    peaks_df = peaks_df.sort_values(by='Wavelength (nm)')
-                    
-                    # Add a column for corresponding visible colors
-                    peaks_df['Spectral Region'] = peaks_df['Wavelength (nm)'].apply(get_color_name)
-                    
-                    # Format the dataframe
-                    peaks_df['Wavelength (nm)'] = peaks_df['Wavelength (nm)'].round(1)
-                    peaks_df['Absorbance'] = peaks_df['Absorbance'].round(4)
-                    
-                    st.dataframe(peaks_df)
-                    
-                    # Add download button for peak data
-                    csv_peaks = io.StringIO()
-                    peaks_df.to_csv(csv_peaks, index=False)
-                    peaks_csv_data = csv_peaks.getvalue()
-                    
-                    st.download_button(
-                        label="Download Peaks CSV",
-                        data=peaks_csv_data,
-                        file_name="absorbance_peaks.csv",
-                        mime="text/csv"
+
+                # Add peak labels (annotations) - limited number
+                max_annotations = 20
+                for i in range(min(peak_count_displayed, max_annotations)):
+                    annotation_y = peak_y[i]
+                    fig.add_annotation(
+                        x=peak_x[i], y=annotation_y,
+                        text=f"{peak_x[i]:.1f}",
+                        showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1,
+                        arrowcolor="#636363",
+                        ax=0, ay=-25,
+                        bgcolor="rgba(255,255,255,0.7)",
+                        borderpad=2,
+                        font=dict(size=9)
                     )
-                else:
-                    st.info("No absorption peaks detected with current settings. Try adjusting the peak detection parameters.")
-                
-                # Download buttons for the processed data
-                st.subheader("Download Results")
-                
-                # CSV download
-                csv_buffer = io.StringIO()
-                df_result.to_csv(csv_buffer, index=False)
-                csv_data = csv_buffer.getvalue()
-                
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name="absorbance_data.csv",
-                    mime="text/csv"
-                )
-                
-                # Add information about Beer-Lambert Law
-                with st.expander("Beer-Lambert Law Information"):
-                    st.write(f"""
-                    ### Beer-Lambert Law
-                    
-                    The Beer-Lambert Law states that absorbance is directly proportional to the concentration of a solution and the path length:
-                    
-                    **A = ε × c × l**
-                        
-                    Where:
-                    - A is the absorbance (dimensionless)
-                    - ε is the molar absorptivity (L·mol⁻¹·cm⁻¹)
-                    - c is the concentration (mol·L⁻¹)
-                    - l is the path length (cm)
-                    
-                    For spectrophotometric measurements:
-                    - A = log₁₀(I₀/I)
-                    - I₀ is the intensity of light passing through the reference
-                    - I is the intensity of light passing through the sample
-                    
-                    In this application:
-                    - Path length = {path_length} mm = {path_length_cm} cm
-                    - The 'Absorbance' column shows the raw calculated values
-                    - The 'Absorbance_per_cm' column normalizes to a 1 cm path length
-                    """)
-                
-                # Add section about averaging multiple scans
-                with st.expander("Benefits of Averaging Multiple Scans"):
-                    st.write("""
-                    ### Why Average Multiple Scans?
-                    
-                    Averaging multiple scans provides several advantages for spectrophotometric measurements:
-                    
-                    1. **Improved Signal-to-Noise Ratio (SNR)**: Averaging N scans improves SNR by a factor of √N. For example, averaging 4 scans doubles the SNR.
-                    
-                    2. **Reduced Random Errors**: Fluctuations due to electronic noise, stray light, or other random factors are minimized.
-                    
-                    3. **Better Precision**: Averaging produces more reliable and reproducible results, especially for low-concentration samples.
-                    
-                    4. **Smoother Spectra**: The resulting spectrum has fewer artifacts and is easier to interpret.
-                    
-                    In this application, you can upload multiple files for reference, sample, and dark measurements. The application automatically averages the spectra before calculating absorbance.
-                    """)
-        
-    except Exception as e:
-        st.error(f"Error processing files: {e}")
-        st.write("Please ensure your files have the correct format with 'Nanometers' and 'Counts' columns separated by spaces.")
+                if peak_count_displayed > max_annotations:
+                     st.info(f"Displaying annotations for the first {max_annotations} peaks out of {peak_count_displayed} found in the selected range.")
 
-# Instructions for file format
-with st.expander("File Format Instructions"):
-    st.write("""
-    Your input files should be in the following format:
-    ```
-    Nanometers Counts
-    348.7 0.0
-    349.2 0.0
-    ...
-    ```
+
+    # Update title with peak count summary
+    peak_source_label = st.session_state.get('peak_source_label', 'Raw')
+    peak_count_text = f"{peak_count_displayed} peak{'s' if peak_count_displayed != 1 else ''} found in range ({peak_source_label})"
+    if peak_count_total != peak_count_displayed:
+         peak_count_text += f" (out of {peak_count_total} total)"
+    fig.update_layout(title=f"{fig.layout.title.text}<br><sub>{peak_count_text}</sub>")
+
+    return fig
+
+# --- Helper Functions ---
+
+def create_download_button(df, label, filename, key_suffix):
+    """Creates a Streamlit download button for a DataFrame."""
+    try:
+        csv_buffer = io.StringIO()
+        # Format floats precisely, handle potential NaN/Inf
+        df.to_csv(csv_buffer, index=False, float_format='%.6g', na_rep='NaN')
+        csv_data = csv_buffer.getvalue().encode('utf-8') # Encode to bytes
+        st.download_button(
+            label=f"📥 {label}", # Add icon
+            data=csv_data,
+            file_name=filename,
+            mime="text/csv",
+            key=f"download_{key_suffix}" # Unique key
+        )
+        return True
+    except Exception as e:
+        st.error(f"Failed to prepare '{filename}' for download: {e}")
+        return False
+
+# --- Streamlit App UI ---
+
+st.set_page_config(page_title="Absorbance Calculator", layout="wide", initial_sidebar_state="expanded")
+
+# --- Sidebar ---
+with st.sidebar:
+    st.header("⚙️ Settings & Info")
+
+    st.markdown("#### Measurement")
+    path_length_mm = st.number_input(
+        "Path Length (mm)",
+        min_value=0.01, max_value=1000.0, value=10.0, step=0.1,
+        help="Optical path length of the cuvette/sample holder in millimeters.",
+        key="path_length_mm_widget"
+    )
+    path_length_cm = path_length_mm / 10.0 if path_length_mm is not None else None
+
+    # --- Analysis Range ---
+    st.markdown("#### Analysis Range")
+    # Use session state to remember the range if files change
+    if 'analysis_min_wl' not in st.session_state:
+        st.session_state.analysis_min_wl = float(DEFAULT_SPECTRUM_MIN)
+    if 'analysis_max_wl' not in st.session_state:
+        st.session_state.analysis_max_wl = float(DEFAULT_SPECTRUM_MAX)
+
+    range_col1, range_col2 = st.columns(2)
+    with range_col1:
+        analysis_min_wl = st.number_input("Min Wavelength (nm)",
+                                          min_value=0.0, # Absolute minimum
+                                          value=st.session_state.analysis_min_wl,
+                                          step=1.0, format="%.1f",
+                                          key="analysis_min_wl_widget",
+                                          help="Minimum wavelength for plot X-axis and peak filtering.")
+    with range_col2:
+         analysis_max_wl = st.number_input("Max Wavelength (nm)",
+                                           min_value=0.0,
+                                           value=st.session_state.analysis_max_wl,
+                                           step=1.0, format="%.1f",
+                                           key="analysis_max_wl_widget",
+                                           help="Maximum wavelength for plot X-axis and peak filtering.")
+
+    # Store valid range in session state
+    if analysis_min_wl < analysis_max_wl:
+        st.session_state.analysis_min_wl = analysis_min_wl
+        st.session_state.analysis_max_wl = analysis_max_wl
+        plot_x_range_user = [analysis_min_wl, analysis_max_wl]
+    else:
+        st.warning("Min Wavelength must be less than Max Wavelength. Using full data range for plots.")
+        plot_x_range_user = None # Indicate invalid range, plots will use data range
+
+    st.markdown("#### Processing")
+    # Smoothing Settings
+    with st.expander("Smoothing (Savitzky-Golay)", expanded=False):
+        apply_smoothing = st.checkbox("Apply Smoothing", value=False, key="apply_smoothing_cb",
+                                      help="Smooth the calculated Absorbance data.")
+        smooth_col1, smooth_col2 = st.columns(2)
+        with smooth_col1:
+            sg_window_length = st.number_input("Window Length", min_value=3, value=11, step=2,
+                                               help="Must be odd.", disabled=not apply_smoothing, key="sg_window")
+        with smooth_col2:
+            sg_poly_order = st.number_input("Polynomial Order", min_value=1, value=2, step=1,
+                                            help="Must be < Window Length.", disabled=not apply_smoothing, key="sg_poly")
+        if apply_smoothing:
+            if sg_window_length % 2 == 0: st.warning("Window Length must be odd.")
+            if sg_poly_order >= sg_window_length: st.warning("Order must be < Window Length.")
+
+    # Peak Detection Settings
+    with st.expander("Peak Detection", expanded=True):
+         peak_source = st.radio("Find peaks on:", ("Raw Absorbance", "Smoothed Absorbance"), index=0, horizontal=True,
+                                key="peak_source_radio", help="Choose data for peak analysis.", disabled=not apply_smoothing)
+         p_col1, p_col2, p_col3 = st.columns(3)
+         with p_col1: peak_height = st.number_input("Min Height (AU)", min_value=0.0, value=0.1, step=0.01, format="%.3f", help="Minimum absorbance.", key="peak_height")
+         with p_col2: peak_distance = st.number_input("Min Distance (nm)", min_value=0.1, value=15.0, step=0.5, format="%.1f", help="Minimum separation.", key="peak_distance")
+         with p_col3: peak_prominence = st.number_input("Min Prominence (AU)", min_value=0.0, value=0.05, step=0.01, format="%.3f", help="Required elevation.", key="peak_prominence")
+
+    # --- Information Expanders ---
+    st.markdown("---")
+    st.markdown("#### ℹ️ Information")
+    with st.expander("File Format Instructions"): st.markdown(...) # Keep content as before
+    with st.expander("About Calculations"): st.markdown(...) # Keep content as before
+
+# --- Main Area ---
+st.title("📊 Spectrophotometry Absorbance Calculator")
+st.write("Upload spectral files, adjust settings in the sidebar, and view results below. Plots update automatically.")
+
+# --- File Upload Section ---
+st.subheader("1. Upload Spectral Data")
+upload_cols = st.columns(3)
+# ... (Keep file upload columns as before) ...
+with upload_cols[0]:
+    st.markdown("##### Reference (Blank)")
+    reference_files = st.file_uploader("Upload reference/blank file(s)", type=["txt", "csv"],
+                                       key="reference_uploader", accept_multiple_files=True, label_visibility="collapsed")
+    if reference_files:
+        st.info(f"{len(reference_files)} file(s) uploaded.")
+        with st.spinner("Loading reference preview..."):
+            df_ref_preview = read_spectral_file(reference_files[0])
+            st.plotly_chart(create_preview_plot(df_ref_preview, "First Ref Preview", "dodgerblue"), use_container_width=True)
+
+with upload_cols[1]:
+    st.markdown("##### Sample")
+    sample_files = st.file_uploader("Upload sample file(s)", type=["txt", "csv"],
+                                    key="sample_uploader", accept_multiple_files=True, label_visibility="collapsed")
+    if sample_files:
+        st.info(f"{len(sample_files)} file(s) uploaded.")
+        with st.spinner("Loading sample preview..."):
+            df_sample_preview = read_spectral_file(sample_files[0])
+            st.plotly_chart(create_preview_plot(df_sample_preview, "First Sample Preview", "mediumseagreen"), use_container_width=True)
+
+
+with upload_cols[2]:
+    st.markdown("##### Dark (Optional)")
+    dark_files = st.file_uploader("Upload dark file(s)", type=["txt", "csv"],
+                                  key="dark_uploader", accept_multiple_files=True, label_visibility="collapsed")
+    if dark_files:
+        st.info(f"{len(dark_files)} file(s) uploaded.")
+        with st.spinner("Loading dark preview..."):
+             df_dark_preview = read_spectral_file(dark_files[0])
+             st.plotly_chart(create_preview_plot(df_dark_preview, "First Dark Preview", "black"), use_container_width=True)
+
+
+# --- Processing and Display Section ---
+st.subheader("2. Results")
+
+if reference_files and sample_files:
+    with st.spinner("Processing files and calculating results..."):
+        df_reference = process_file_uploads(reference_files, "Reference")
+        df_sample = process_file_uploads(sample_files, "Sample")
+        df_dark = process_file_uploads(dark_files, "Dark") if dark_files else None
+
+        df_result = None
+        if df_reference is not None and df_sample is not None:
+            if dark_files and df_dark is None:
+                st.error("Dark files uploaded but failed processing. Cannot proceed.")
+                st.stop()
+            else:
+                 df_result = calculate_absorbance(df_reference, df_sample, df_dark, path_length_cm)
+
+    if df_result is not None:
+        st.success("Calculations complete.")
+
+        # Determine data range, but use user range for plotting if valid
+        data_min_wl = df_result['Nanometers'].min()
+        data_max_wl = df_result['Nanometers'].max()
+        # Use user range if valid, otherwise fall back to data range
+        final_plot_x_range = plot_x_range_user if plot_x_range_user else [data_min_wl, data_max_wl]
+
+
+        # --- Apply Smoothing (if enabled and valid) ---
+        smoothed_absorbance_values = None
+        smoothing_error = False
+        if apply_smoothing:
+            # ... (smoothing logic remains the same) ...
+            with st.spinner("Applying Savitzky-Golay smoothing..."):
+                if sg_window_length % 2 != 0 and sg_poly_order < sg_window_length and len(df_result['Absorbance']) >= sg_window_length:
+                    smoothed_absorbance_values = apply_savitzky_golay(
+                        df_result['Absorbance'].values, sg_window_length, sg_poly_order
+                    )
+                    if smoothed_absorbance_values is None:
+                        smoothing_error = True
+                        st.warning("Smoothing failed during application.")
+                    else:
+                        df_result['Absorbance_Smoothed'] = smoothed_absorbance_values
+                        st.info(f"Applied Savitzky-Golay smoothing (Window: {sg_window_length}, Order: {sg_poly_order}).")
+                else:
+                    smoothing_error = True
+                    st.warning("Smoothing skipped due to invalid parameters or insufficient data.")
+
+
+        # --- Find Peaks (on full spectrum) ---
+        absorption_peaks_info = None
+        peak_data_label = "Raw Absorbance"
+        st.session_state['peak_source_label'] = peak_data_label
+
+        with st.spinner("Finding absorption peaks..."):
+            absorbance_for_peaks = df_result['Absorbance'].values
+            if apply_smoothing and not smoothing_error and peak_source == "Smoothed Absorbance":
+                 if smoothed_absorbance_values is not None:
+                     absorbance_for_peaks = smoothed_absorbance_values
+                     peak_data_label = "Smoothed Absorbance"
+                     st.session_state['peak_source_label'] = peak_data_label
+                 else: st.warning("Smoothed peaks requested, but smoothing failed. Using raw data.")
+            elif apply_smoothing and peak_source == "Smoothed Absorbance" and smoothing_error:
+                 st.warning("Smoothed peaks requested, but smoothing failed. Using raw data.")
+
+            # Find peaks on the *full* selected spectrum
+            absorption_peaks_info = find_absorption_peaks(
+                df_result['Nanometers'].values, absorbance_for_peaks,
+                peak_height, peak_distance, peak_prominence
+            )
+            if absorption_peaks_info is None: st.warning("Peak finding failed.")
+
+
+        # --- Display Plots in Tabs (using final_plot_x_range) ---
+        tab1, tab2, tab3, tab4 = st.tabs(["📈 Absorbance Plot", "📊 Results Table", "📉 Counts Plots", "ℹ️ Peak Details"])
+
+        with tab1: # Absorbance Plot
+            st.plotly_chart(
+                plot_absorbance(
+                    df_result, path_length_mm, absorption_peaks_info,
+                    smoothed_absorbance_values, final_plot_x_range # Pass user/data range
+                ), use_container_width=True
+            )
+
+        with tab2: # Results Table (Full Data)
+            st.markdown("#### Calculated Data (Full Range)")
+            # ... (table display logic remains the same) ...
+            display_df = df_result.copy()
+            cols_to_show = ['Nanometers', 'Absorbance', 'Absorbance_per_cm']
+            if 'Absorbance_Smoothed' in display_df.columns and display_df['Absorbance_Smoothed'].notna().any():
+                 cols_to_show.insert(2, 'Absorbance_Smoothed')
+            if 'Dark_Counts' in display_df.columns:
+                 cols_to_show.extend(['Reference_Counts', 'Sample_Counts', 'Dark_Counts', 'Reference_Corrected', 'Sample_Corrected'])
+            else:
+                 cols_to_show.extend(['Reference_Counts', 'Sample_Counts', 'Reference_Corrected', 'Sample_Corrected'])
+            display_df = display_df[cols_to_show]
+            display_df.rename(columns={ 'Absorbance_per_cm': f'Absorbance (1cm Path)', 'Absorbance_Smoothed': 'Absorbance (Smoothed)', 'Reference_Counts': 'Ref Counts (Raw)', 'Sample_Counts': 'Sample Counts (Raw)', 'Dark_Counts': 'Dark Counts', 'Reference_Corrected': 'Ref Counts (Corrected)', 'Sample_Corrected': 'Sample Counts (Corrected)' }, inplace=True)
+            st.dataframe(display_df, height=400, use_container_width=True)
+            create_download_button(display_df, "Download Full Results", "absorbance_results_full.csv", "results_full")
+
+
+        with tab3: # Counts Plots (using final_plot_x_range)
+            st.markdown("#### Raw Counts")
+            st.plotly_chart(plot_raw_counts(df_result, df_result.get('Dark_Counts'), final_plot_x_range), use_container_width=True)
+            st.markdown("#### Dark-Corrected Counts")
+            st.plotly_chart(plot_corrected_counts(df_result, final_plot_x_range), use_container_width=True)
+
+        with tab4: # Peak Details (Filtered by final_plot_x_range)
+            st.markdown(f"#### Peak Detection Summary ({peak_data_label})")
+            if absorption_peaks_info is not None and len(absorption_peaks_info[0]) > 0:
+                peak_indices, properties = absorption_peaks_info
+                # Create DataFrame with all peaks first
+                all_peaks_df = pd.DataFrame({
+                    'Wavelength (nm)': df_result['Nanometers'].values[peak_indices],
+                    'Absorbance (AU)': absorbance_for_peaks[peak_indices],
+                    'Height (AU)': properties.get('peak_heights', np.nan),
+                    'Prominence (AU)': properties.get('prominences', np.nan),
+                    'Color Region': [get_color_name(wl) for wl in df_result['Nanometers'].values[peak_indices]]
+                })
+                all_peaks_df = all_peaks_df.sort_values(by='Wavelength (nm)')
+
+                # Filter the DataFrame based on the selected range
+                min_r, max_r = final_plot_x_range
+                filtered_peaks_df = all_peaks_df[
+                    (all_peaks_df['Wavelength (nm)'] >= min_r) &
+                    (all_peaks_df['Wavelength (nm)'] <= max_r)
+                ]
+
+                st.markdown(f"Displaying peaks within **{min_r:.1f} nm** to **{max_r:.1f} nm** range:")
+                st.dataframe(filtered_peaks_df, use_container_width=True)
+                # Download button for the filtered peaks
+                create_download_button(filtered_peaks_df, "Download Filtered Peak List", "absorption_peaks_filtered.csv", "peaks_filtered")
+            elif absorption_peaks_info is not None:
+                st.info("No peaks found matching the specified criteria in the full spectrum.")
+            else:
+                st.warning("Peak finding was not performed or encountered an error.")
+
     
-    - The first line should contain the column headers: 'Nanometers' and 'Counts'
-    - Each subsequent line should contain the wavelength and count values separated by space(s)
-    - All files must have measurements at the same wavelengths
-    - The files can be .txt or .csv files
-    
-    ### Multiple File Upload
-    
-    - You can now upload multiple files for reference, sample, and dark measurements
-    - The application will average the spectra from multiple files
-    - This helps reduce noise and improve measurement accuracy
-    - All files being averaged must have the same wavelength points
-    """)
+    elif reference_files and sample_files: # Files uploaded, but df_result is None
+        st.error("Calculation could not be completed. Check file formats and wavelength consistency.")
+
+else:
+    st.info("⬅️ Upload Reference (Blank) and Sample files to begin.")
+
