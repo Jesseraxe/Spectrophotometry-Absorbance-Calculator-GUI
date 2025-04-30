@@ -26,8 +26,6 @@ This repository includes the following Streamlit applications:
     * Upload a single spectrum file (`.csv`, `.txt`).
     * View a data preview and basic statistics.
     * Display an interactive plot of the spectrum.
-* **Feedback Form (`Provide_Feedback.py`)**:
-    * A simple page with a form to collect user feedback.
 
 ## Requirements
 
