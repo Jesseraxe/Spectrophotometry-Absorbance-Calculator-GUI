@@ -9,6 +9,7 @@ A collection of Streamlit tools designed for processing, analyzing, and visualiz
 This repository includes the following Streamlit applications:
 
 * **Absorbance Calculator (`Absorbance_Calculator.py`)**:
+* ![absorbance calculator](./absorbance_calculator.png)
     * Upload reference (blank), sample, and optional dark spectra files (`.txt`, `.csv`).
     * Calculate absorbance spectra.
     * Apply Savitzky-Golay smoothing to absorbance data.
@@ -16,6 +17,7 @@ This repository includes the following Streamlit applications:
     * Plot raw counts, dark-corrected counts, and final absorbance.
     * Download calculated results.
 * **Polynomial Fitter (`Polynomial_Fitter.py`)**:
+*  ![polynomial fitter](./polynomial_fitter.png)
     * Upload multiple absorbance spectra CSV files (e.g., from the Absorbance Calculator) and input corresponding concentrations.
     * Select a target peak wavelength (auto-detect or manual).
     * Perform polynomial fitting (degrees 1-5) on concentration vs. peak absorbance data.
@@ -23,6 +25,7 @@ This repository includes the following Streamlit applications:
     * Visualize the concentration curve and the original spectra with marked peaks.
     * Download analysis results.
 * **Spectrum Viewer (`Preview_Spectra.py`)**:
+*  ![preview spectra](./preview_spectra.png)
     * Upload a single spectrum file (`.csv`, `.txt`).
     * View a data preview and basic statistics.
     * Display an interactive plot of the spectrum.
