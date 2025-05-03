@@ -1,4 +1,4 @@
-## Streamlit Link: [Spectrophotometry Absorbance Calculator](https://spectrophotometry-gui.streamlit.app/)
+## Streamlit Link: [Spectrophotometry Absorbance Calculator](https://spectrophotometry-analysis.streamlit.app/)
 
 # Spectrophotometry Analysis Suite
 
